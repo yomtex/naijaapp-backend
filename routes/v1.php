@@ -23,7 +23,8 @@ Route::middleware('auth:api')->group(function () {
     Route::post('/set-transfer-pin', [AuthController::class, 'setTransferPin']);
 
         // Transaction Routes (prefix optional, e.g., /transaction/send)
-    Route::prefix('transaction')->group(function () {
+    Route::prefix('transfer')->group(function () {
+        Route::post('/lookup', [TransactionController::class, 'lookupByEmail']);
         Route::post('/send', [TransactionController::class, 'sendMoney']);
         Route::post('/request', [TransactionController::class, 'requestMoney']);
         Route::post('/respond/{id}', [TransactionController::class, 'respondToRequest']);

@@ -13,7 +13,7 @@ class User extends Authenticatable implements JWTSubject
     protected $fillable = [
         'name', 'email', 'password', 'pin', 'otp_pin',
         'balance', 'available_balance','transfer_pin',
-        'transfer_locked',
+        'transfer_locked','user_status',
     ];
 
 
@@ -31,6 +31,12 @@ class User extends Authenticatable implements JWTSubject
     public function getJWTCustomClaims()
     {
         return [];
+    }
+
+    // In User.php
+    public function isBanned(): bool
+    {
+        return $this->user_status === 'banned';
     }
 
     public function incrementRiskScore(int $points = 1, int $max = 100): void

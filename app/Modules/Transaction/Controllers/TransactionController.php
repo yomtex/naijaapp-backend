@@ -10,38 +10,106 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use App\Models\UserReputationScore;
+use Illuminate\Support\Facades\Validator;
+
 
 class TransactionController extends Controller
 {
+    public function lookupByEmail(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:users,email',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $authenticatedUser = auth()->user(); // Assuming auth is middleware protected
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+        }
+
+        if ($user->id === $authenticatedUser->id) {
+            return response()->json([
+                'message' => 'You cannot send money to yourself.',
+            ], 403);
+        }
+
+        if ($user->user_status === 'banned') {
+            return response()->json([
+                'message' => 'This user is currently banned and cannot receive money.',
+            ], 403);
+        }
+
+        return response()->json([
+            'id' => $user->id,
+            'name' => $user->name,
+            'email' => $user->email,
+        ]);
+    }
+
+
+
     public function sendMoney(Request $request)
     {
-        $request->validate([
+        $validator = Validator::make($request->all(), [
             'receiver_email' => 'required|email|exists:users,email',
             'amount' => 'required|numeric|min:1',
-            'purpose' => 'required|in:friends_family,goods_services',
-            'transfer_pin' => 'required|digits:6',
+            'purpose' => 'required|in:Family and Friends,Goods and Services',
+            'transfer_pin' => 'required|digits:4',
             'note' => 'nullable|string|max:255',
         ]);
 
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
         $sender = auth()->user();
 
-        if (!Hash::check($request->transfer_pin, $sender->transfer_pin)) {
-            return response()->json(['message' => 'Invalid transfer PIN'], 403);
+
+        // if (!Hash::check($request->transfer_pin, $sender->transfer_pin)) {
+        //     return response()->json(['message' => 'Invalid transfer PIN'], 403);
+        // }
+
+        $receiver = User::where('email', $request->receiver_email)->first(); // ✅ move this up
+        
+        if ($sender->user_status === 'banned') {
+            return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
         }
 
+        if ($receiver->user_status === 'banned') {
+            return response()->json(['message' => 'Receiver is currently banned and cannot accept transfers.'], 403);
+        }
+        $purposeMap = [
+            'Family and Friends' => 'friends_family',
+            'Goods and Services' => 'goods_services',
+        ];
+
+        $normalizedPurpose = $purposeMap[$request->purpose];
+
+        $isGoods = $normalizedPurpose === 'goods_services';
+
         // Check local trust score before allowing
-        $localScore = UserReputationScore::where('reporter_id', $sender->id)
+        $localScore = \App\Models\UserReputationScore::where('reporter_id', $sender->id)
             ->where('reported_id', $receiver->id)
             ->value('score');
 
-        if ($request->purpose === 'goods_services' && $localScore >= 5) {
+        if ($isGoods && $localScore >= 5) {
             return response()->json([
                 'message' => 'You are not allowed to send to this user via goods & services due to past disputes.',
             ], 403);
         }
 
         // Check global reputation score
-        if ($request->purpose === 'goods_services' && $receiver->risk_score >= 10) {
+        if ($isGoods && $receiver->risk_score >= 10) {
             return response()->json([
                 'message' => 'Receiver is restricted from accepting goods & services transfers due to multiple complaints.',
             ], 403);
@@ -51,15 +119,11 @@ class TransactionController extends Controller
             return response()->json(['message' => 'Insufficient available balance'], 400);
         }
 
-        $receiver = User::where('email', $request->receiver_email)->first();
-        $isGoods = $request->purpose === 'goods_services';
-
         if ($receiver->risk_score >= 60 && $request->amount > 5000) {
             return response()->json([
                 'message' => 'Receiver is currently restricted from receiving large transfers due to dispute history.',
             ], 403);
         }
-
 
         if ($isGoods) {
             $pendingCount = Transaction::where('receiver_id', $receiver->id)
@@ -109,16 +173,33 @@ class TransactionController extends Controller
         }
     }
 
+
     public function requestMoney(Request $request)
     {
-        $request->validate([
+        $validator = Validator::make($request->all(), [
             'receiver_email' => 'required|email|exists:users,email',
             'amount' => 'required|numeric|min:1',
             'note' => 'nullable|string|max:255',
         ]);
 
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
         $sender = auth()->user(); // requester
         $receiver = User::where('email', $request->receiver_email)->first();
+
+        if ($sender->user_status === 'banned') {
+            return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
+        }
+
+        if ($receiver->user_status === 'banned') {
+            return response()->json(['message' => 'Receiver is currently banned and cannot accept transfers.'], 403);
+        }
+
 
         try {
             DB::beginTransaction();
@@ -199,10 +280,16 @@ class TransactionController extends Controller
 
     public function openDispute(Request $request, $id)
     {
-        $request->validate([
-            'evidence' => 'nullable|image|max:2048', // Optional image
+        $validator = Validator::make($request->all(), [
+            'evidence' => 'nullable|image|max:2048', // Max 2MB
         ]);
 
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
         $user = auth()->user();
 
         $transaction = Transaction::where('id', $id)
@@ -284,16 +371,52 @@ class TransactionController extends Controller
     }
 
 
-    public function history()
+    public function history(Request $request)
     {
         $user = auth()->user();
 
-        $transactions = \App\Modules\Transaction\Models\Transaction::where(function ($query) use ($user) {
-            $query->where('sender_id', $user->id)
+        if ($user->user_status === 'banned') {
+            return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
+        }
+        $query = \App\Modules\Transaction\Models\Transaction::with(['sender:id,name', 'receiver:id,name'])
+            ->where(function ($q) use ($user) {
+                $q->where('sender_id', $user->id)
                 ->orWhere('receiver_id', $user->id);
-        })->latest()->get();
+            })
+            ->latest();
 
-        return response()->json($transactions);
+        // Check for ?limit=5 (recent transactions use case)
+        if ($request->has('limit')) {
+            $transactions = $query->limit((int) $request->limit)->get();
+        } else {
+            // Full history (paginated by default)
+            $transactions = $query->paginate($request->get('per_page', 20));
+        }
+
+        // Format response
+        $mapped = $transactions->map(function ($tx) use ($user) {
+            return [
+                'id' => $tx->id,
+                'reference' => $tx->reference,
+                'amount' => $tx->amount,
+                'type' => $tx->sender_id === $user->id ? 'debit' : 'credit',
+                'status' => $tx->status,
+                'purpose' => $tx->purpose,
+                'note' => $tx->note,
+                'counterparty' => $tx->sender_id === $user->id
+                    ? ($tx->receiver->name ?? 'Unknown')
+                    : ($tx->sender->name ?? 'Unknown'),
+                'timestamp' => $tx->created_at->toDateTimeString(),
+            ];
+        });
+
+        return response()->json([
+            'data' => $mapped,
+            'meta' => [
+                'total' => $transactions instanceof \Illuminate\Pagination\AbstractPaginator ? $transactions->total() : $mapped->count(),
+            ],
+        ]);
     }
+
 
 }
