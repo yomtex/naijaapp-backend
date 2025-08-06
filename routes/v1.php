@@ -6,12 +6,12 @@ use App\Modules\Transaction\Controllers\TransactionController;
 
 Route::prefix('auth')->group(function () {
     Route::post('/register', [AuthController::class, 'register']);
-    Route::post('/login', [AuthController::class, 'login']);
+    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:5,1'); // 5 attempts per minute
     Route::post('/verify-email', [AuthController::class, 'verifyEmail']);
-    Route::post('/resend-otp', [AuthController::class, 'resendOtp']);
+    Route::post('/resend-otp', [AuthController::class, 'resendOtp'])->middleware('throttle:3,1'); // 3 attempts per minute
     Route::post('/refresh-token', [AuthController::class, 'refreshWithToken']);
     Route::post('/set-pin', [AuthController::class, 'setPin']);
-    Route::post('/pin-login', [AuthController::class, 'pinLogin']);
+    Route::post('/pin-login', [AuthController::class, 'pinLogin'])->middleware('throttle:5,1'); // 5 attempts per minute
 
 
 });
