@@ -84,32 +84,6 @@ class AuthController extends Controller
         }
     }
 
-    public function oldlogin(Request $request)
-    {
-        $credentials = $request->only('email', 'password');
-
-        $user = User::where('email', $credentials['email'])->first();
-
-        if (!$user || !Hash::check($credentials['password'], $user->password)) {
-            return response()->json(['message' => 'Invalid login credentials'], 401);
-        }
-
-        // ✅ Always generate a fresh OTP and store it
-        $otp = rand(100000, 999999);
-        $user->otp_pin = $otp;
-        $user->save();
-
-        // ✅ (Optional) Send via email/SMS here
-        // Mail::to($user->email)->send(new OtpMail($otp));
-        Log::info("OTP for {$user->email} is {$user->otp_pin}");
-
-        return response()->json([
-            'status' => 'otp_required',
-            'email' => $user->email,
-            'message' => 'OTP sent. Please verify to complete login.',
-        ], 200);
-    }
-
     public function login(Request $request)
     {
         $credentials = $request->only('email', 'password');
