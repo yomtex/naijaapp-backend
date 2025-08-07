@@ -13,6 +13,8 @@ use Tymon\JWTAuth\Facades\JWTAuth;
 use Illuminate\Support\Str;
 use App\Models\RefreshToken;
 use Illuminate\Support\Facades\Log;
+use App\Rules\StrongPin;
+
 
 
 class AuthController extends Controller
@@ -126,12 +128,11 @@ class AuthController extends Controller
         ], 200);
     }
 
-
     public function setPin(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'email' => 'required|email|exists:users,email',
-            'pin' => 'required|digits:6',
+            'pin' => ['required', 'digits:6', new StrongPin()],
         ]);
 
         if ($validator->fails()) {
@@ -191,6 +192,7 @@ class AuthController extends Controller
         }
 
         // Clear the OTP
+        $user->is_verified = 1;
         $user->otp_pin = null;
         $user->save();
 
@@ -311,10 +313,24 @@ class AuthController extends Controller
 
     public function setTransferPin(Request $request)
     {
-        $request->validate([
-            'transfer_pin' => 'required|digits:6',
+        $validator = Validator::make($request->all(), [
+            'transfer_pin' => ['required', 'digits:4', new StrongPin()],
         ]);
 
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422); // 422 Unprocessable Entity is the standard for validation errors
+        }
+
+        
+        // Reject weak PINs
+        if ($this->isWeakPin($request->pin)) {
+            return response()->json([
+                'message' => 'The PIN provided is too weak. Please choose a more secure PIN.',
+            ], 422);
+        }
         $user = auth()->user();
 
         if ($user->transfer_pin) {
