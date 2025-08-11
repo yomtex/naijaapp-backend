@@ -6,10 +6,9 @@ use Illuminate\Console\Command;
 use Illuminate\Console\Scheduling\Attributes\AsScheduled;
 use App\Modules\Transaction\Models\Transaction;
 use Carbon\Carbon;
-use App\Notifications\TransactionCompleted;
-use App\Models\TransactionLog;
+use App\Jobs\ReleaseFundsJob;
 
-#[AsScheduled('everyMinute')] // <- run every minute, or change to 'everyTwentyMinutes'
+#[AsScheduled('everyMinute')] // run every minute
 class ReleasePendingFunds extends Command
 {
     protected $signature = 'funds:release-pending';
@@ -18,39 +17,29 @@ class ReleasePendingFunds extends Command
     public function handle(): void
     {
         $now = Carbon::now();
+        $totalQueued = 0;
 
-        $pending = Transaction::where('purpose', 'goods_services')
+        Transaction::where('purpose', 'goods_services')
             ->where('status', 'pending')
             ->where('disputed', false)
+            ->where('in_progress', false) // Only those not already being processed
             ->whereNotNull('scheduled_release_at')
             ->where('scheduled_release_at', '<=', $now)
-            ->get();
+            ->orderBy('id')
+            ->chunkById(100, function ($transactions) use (&$totalQueued) {
+                foreach ($transactions as $tx) {
+                    // Atomically mark in_progress = true only if currently false
+                    $updated = Transaction::where('id', $tx->id)
+                        ->where('in_progress', false)
+                        ->update(['in_progress' => true]);
 
-        foreach ($pending as $tx) {
-            $receiver = $tx->receiver;
-            if (!$receiver) continue;
-            $receiver->balance += $tx->amount;
-            $receiver->available_balance += $tx->amount;
-            $receiver->save();
+                    if ($updated) {
+                        ReleaseFundsJob::dispatch($tx->id)->onQueue('funds_releases');
+                        $totalQueued++;
+                    }
+                }
+            });
 
-            $tx->status = 'completed';
-            $tx->processed_at = $now;
-            $tx->save();
-
-             // Notify
-            //  Uncomment in production
-            // $receiver->notify(new TransactionCompleted($tx));
-            Log::info("Funds released for transaction {$tx->reference} to receiver {$receiver->email}");
-
-
-            // Log
-            TransactionLog::create([
-                'transaction_id' => $tx->id,
-                'action' => 'released',
-                'note' => 'Funds auto-released after scheduled hold.',
-            ]);
-        }
-
-        $this->info("Released {$pending->count()} pending transactions.");
+        $this->info("Queued {$totalQueued} pending transactions for release.");
     }
 }
