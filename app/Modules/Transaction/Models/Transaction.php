@@ -14,4 +14,15 @@ class Transaction extends Model
         'amount' => 'float',
         'processed_at' => 'datetime',
     ];
+
+     public function sender()
+    {
+        return $this->belongsTo(\App\Modules\Auth\Models\User::class, 'sender_id');
+    }
+
+    // Define the receiver relationship
+    public function receiver()
+    {
+        return $this->belongsTo(\App\Modules\Auth\Models\User::class, 'receiver_id');
+    }
 }

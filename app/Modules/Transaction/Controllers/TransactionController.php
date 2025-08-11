@@ -116,7 +116,7 @@ class TransactionController extends Controller
         }
 
         if ($sender->available_balance < $request->amount) {
-            return response()->json(['message' => 'Insufficient available balance'], 400);
+            return response()->json(['message' => 'Insufficient Float'], 400);
         }
 
         if ($receiver->risk_score >= 60 && $request->amount > 5000) {
@@ -147,7 +147,7 @@ class TransactionController extends Controller
                 'receiver_id' => $receiver->id,
                 'amount' => $request->amount,
                 'type' => 'send',
-                'purpose' => $request->purpose,
+                'purpose' => $normalizedPurpose,
                 'reference' => strtoupper(Str::random(12)),
                 'note' => $request->note,
                 'status' => $isGoods ? 'pending' : 'completed',
@@ -371,52 +371,76 @@ class TransactionController extends Controller
     }
 
 
-    public function history(Request $request)
-    {
-        $user = auth()->user();
+   public function history(Request $request)
+{
+    $user = auth()->user();
 
-        if ($user->user_status === 'banned') {
-            return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
-        }
-        $query = \App\Modules\Transaction\Models\Transaction::with(['sender:id,name', 'receiver:id,name'])
-            ->where(function ($q) use ($user) {
-                $q->where('sender_id', $user->id)
-                ->orWhere('receiver_id', $user->id);
-            })
-            ->latest();
-
-        // Check for ?limit=5 (recent transactions use case)
-        if ($request->has('limit')) {
-            $transactions = $query->limit((int) $request->limit)->get();
-        } else {
-            // Full history (paginated by default)
-            $transactions = $query->paginate($request->get('per_page', 20));
-        }
-
-        // Format response
-        $mapped = $transactions->map(function ($tx) use ($user) {
-            return [
-                'id' => $tx->id,
-                'reference' => $tx->reference,
-                'amount' => $tx->amount,
-                'type' => $tx->sender_id === $user->id ? 'debit' : 'credit',
-                'status' => $tx->status,
-                'purpose' => $tx->purpose,
-                'note' => $tx->note,
-                'counterparty' => $tx->sender_id === $user->id
-                    ? ($tx->receiver->name ?? 'Unknown')
-                    : ($tx->sender->name ?? 'Unknown'),
-                'timestamp' => $tx->created_at->toDateTimeString(),
-            ];
-        });
-
-        return response()->json([
-            'data' => $mapped,
-            'meta' => [
-                'total' => $transactions instanceof \Illuminate\Pagination\AbstractPaginator ? $transactions->total() : $mapped->count(),
-            ],
-        ]);
+    if ($user->user_status === 'banned') {
+        return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
     }
+
+    $query = \App\Modules\Transaction\Models\Transaction::with(['sender:id,name', 'receiver:id,name'])
+        ->where(function ($q) use ($user) {
+            $q->where('sender_id', $user->id)
+              ->orWhere('receiver_id', $user->id);
+        })
+        ->latest();
+
+    if ($request->has('limit')) {
+        $transactions = $query->limit((int) $request->limit)->get();
+    } else {
+        $transactions = $query->paginate($request->get('per_page', 20));
+    }
+
+    $purposeLabels = [
+        'friends_family' => 'Family & Friends',
+        'goods_services' => 'Goods & Services',
+    ];
+
+    $currencySymbol = '₦';
+
+    $mapped = $transactions->map(function ($tx) use ($user, $purposeLabels, $currencySymbol) {
+        $isSender = $tx->sender_id === $user->id;
+        $amountSign = $isSender ? '-' : '+';
+        $title = $isSender ? 'Payment sent' : 'Payment received';
+
+        return [
+            // Raw DB fields for Dart model
+            'id' => $tx->id,
+            'sender_id' => $tx->sender_id,
+            'receiver_id' => $tx->receiver_id,
+            'amount' => $tx->amount,
+            'type' => $isSender ? 'send' : 'request', // or your real type column
+            'purpose' => $tx->purpose,
+            'reference' => $tx->reference,
+            'note' => $tx->note,
+            'status' => $tx->status,
+            'disputed' => (bool) $tx->disputed,
+            'processed_at' => $tx->processed_at,
+            'scheduled_release_at' => $tx->scheduled_release_at,
+            'created_at' => $tx->created_at,
+            'updated_at' => $tx->updated_at,
+
+            // UI helper fields for direct rendering
+            'title' => $title,
+            'subtitle' => $isSender ? ($tx->receiver->name ?? 'Unknown') : ($tx->sender->name ?? 'Unknown'),
+            'typeLabel' => $purposeLabels[$tx->purpose] ?? 'Other',
+            'amountFormatted' => $amountSign . $currencySymbol . number_format($tx->amount, 2),
+            'dateTime' => $tx->created_at->format('d/m/Y, H:i:s'),
+            'total' => $currencySymbol . number_format($user->balance ?? 0, 2),
+        ];
+    });
+
+    return response()->json([
+        'data' => $mapped,
+        'meta' => [
+            'total' => $transactions instanceof \Illuminate\Pagination\AbstractPaginator
+                ? $transactions->total()
+                : $mapped->count(),
+        ],
+    ]);
+}
+
 
 
 }
