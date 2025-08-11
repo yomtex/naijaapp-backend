@@ -1,5 +1,5 @@
 <?php
-namespace App\Modules\AuthController\Rules;
+namespace App\Modules\Auth\Rules;
 
 use Illuminate\Contracts\Validation\Rule;
 

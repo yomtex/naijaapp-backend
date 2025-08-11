@@ -13,7 +13,7 @@ use Tymon\JWTAuth\Facades\JWTAuth;
 use Illuminate\Support\Str;
 use App\Models\RefreshToken;
 use Illuminate\Support\Facades\Log;
-use App\Rules\StrongPin;
+use App\Modules\Auth\Rules\StrongPin;
 
 
 
@@ -116,10 +116,8 @@ class AuthController extends Controller
         // ✅ Verified AND PIN already set → Generate OTP
         $otp = rand(100000, 999999);
         $user->otp_pin = $otp;
+        $this->sendOtpEmail($user->email, $otp);
         $user->save();
-
-        // Optional: Send OTP via email/SMS
-        Log::info("OTP for {$user->email} is {$otp}");
 
         return response()->json([
             'status' => 'otp_required',
@@ -136,11 +134,13 @@ class AuthController extends Controller
         ]);
 
         if ($validator->fails()) {
+            $errorMessages = $validator->errors()->all(); // Get flat list of messages
+
             return response()->json([
-                'message' => 'Validation failed',
-                'errors' => $validator->errors(),
+                'message' => $errorMessages[0] ?? 'Validation failed', // Return first error
             ], 422);
         }
+
 
         $user = User::where('email', $request->email)->first();
 
