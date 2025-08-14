@@ -11,7 +11,9 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use App\Models\UserReputationScore;
 use Illuminate\Support\Facades\Validator;
-
+use App\Jobs\ReleaseFundsJob;
+use Carbon\Carbon;
+use App\Models\TransactionLog;
 
 class TransactionController extends Controller
 {
@@ -55,9 +57,9 @@ class TransactionController extends Controller
     }
 
 
-
     public function sendMoney(Request $request)
     {
+        // Validation
         $validator = Validator::make($request->all(), [
             'receiver_email' => 'required|email|exists:users,email',
             'amount' => 'required|numeric|min:1',
@@ -72,57 +74,51 @@ class TransactionController extends Controller
                 'errors' => $validator->errors(),
             ], 422);
         }
+
         $sender = auth()->user();
 
-
+        // Verify transfer PIN
         // if (!Hash::check($request->transfer_pin, $sender->transfer_pin)) {
         //     return response()->json(['message' => 'Invalid transfer PIN'], 403);
         // }
 
-        $receiver = User::where('email', $request->receiver_email)->first(); // ✅ move this up
-        
+        $receiver = User::where('email', $request->receiver_email)->first();
+
         if ($sender->user_status === 'banned') {
             return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
         }
 
         if ($receiver->user_status === 'banned') {
-            return response()->json(['message' => 'Receiver is currently banned and cannot accept transfers.'], 403);
+            return response()->json(['message' => 'Receiver cannot accept transfers.'], 403);
         }
+
         $purposeMap = [
             'Family and Friends' => 'friends_family',
             'Goods and Services' => 'goods_services',
         ];
 
         $normalizedPurpose = $purposeMap[$request->purpose];
-
         $isGoods = $normalizedPurpose === 'goods_services';
 
-        // Check local trust score before allowing
+        // Risk and reputation checks
         $localScore = \App\Models\UserReputationScore::where('reporter_id', $sender->id)
             ->where('reported_id', $receiver->id)
-            ->value('score');
+            ->value('score') ?? 0;
 
         if ($isGoods && $localScore >= 5) {
-            return response()->json([
-                'message' => 'You are not allowed to send to this user via goods & services due to past disputes.',
-            ], 403);
+            return response()->json(['message' => 'Cannot send due to past disputes.'], 403);
         }
 
-        // Check global reputation score
         if ($isGoods && $receiver->risk_score >= 10) {
-            return response()->json([
-                'message' => 'Receiver is restricted from accepting goods & services transfers due to multiple complaints.',
-            ], 403);
+            return response()->json(['message' => 'Receiver restricted from Goods & Services transfers.'], 403);
         }
 
         if ($sender->available_balance < $request->amount) {
-            return response()->json(['message' => 'Insufficient Float'], 400);
+            return response()->json(['message' => 'Insufficient balance'], 400);
         }
 
         if ($receiver->risk_score >= 60 && $request->amount > 5000) {
-            return response()->json([
-                'message' => 'Receiver is currently restricted from receiving large transfers due to dispute history.',
-            ], 403);
+            return response()->json(['message' => 'Large transfers restricted due to dispute history.'], 403);
         }
 
         if ($isGoods) {
@@ -142,6 +138,7 @@ class TransactionController extends Controller
         try {
             DB::beginTransaction();
 
+            // Create transaction
             $transaction = Transaction::create([
                 'sender_id' => $sender->id,
                 'receiver_id' => $receiver->id,
@@ -152,12 +149,14 @@ class TransactionController extends Controller
                 'note' => $request->note,
                 'status' => $isGoods ? 'pending' : 'completed',
                 'processed_at' => $isGoods ? null : now(),
-                'scheduled_release_at' => $isGoods ? now()->addMinutes(20) : null,
+                'scheduled_release_at' => $isGoods ? now()->addMinutes(20) : null, // optional, for display
             ]);
 
+            // Deduct sender balance
             $sender->available_balance -= $request->amount;
             $sender->save();
 
+            // Instant transfer for Family & Friends
             if (!$isGoods) {
                 $receiver->balance += $request->amount;
                 $receiver->available_balance += $request->amount;
@@ -165,14 +164,101 @@ class TransactionController extends Controller
             }
 
             DB::commit();
-            return response()->json(['message' => 'Transfer successful', 'transaction' => $transaction]);
+
+            // Queue delayed release for Goods & Services
+            if ($isGoods) {
+                ReleaseFundsJob::dispatch($transaction->id)
+                    ->delay(now()->addMinutes(20))
+                    ->onQueue('funds_releases');
+            }
+
+            return response()->json([
+                'message' => 'Transfer successful',
+                'transaction' => $transaction
+            ]);
 
         } catch (\Throwable $e) {
             DB::rollBack();
-            return response()->json(['message' => 'Something went wrong', 'error' => $e->getMessage()], 500);
+            return response()->json([
+                'message' => 'Something went wrong',
+                'error' => $e->getMessage()
+            ], 500);
         }
     }
 
+
+    public function cancelTransaction(Request $request, $transactionId)
+    {
+        $sender = auth()->user();
+
+        $tx = Transaction::where('id', $transactionId)
+            ->where('sender_id', $sender->id)
+            ->where('purpose', 'goods_services')
+            ->where('status', 'pending')
+            ->first();
+
+        if (!$tx) {
+            return response()->json([
+                'message' => 'Transaction not found or cannot be canceled'
+            ], 404);
+        }
+        
+        if ($tx->in_progress) {
+            return response()->json([
+                'message' => 'Transaction is currently being processed and cannot be canceled'
+            ], 403);
+        }
+
+        // Check if 20 minutes have passed
+        if (Carbon::now()->gt($tx->created_at->addMinutes(20))) {
+            return response()->json([
+                'message' => 'Cancellation period has expired'
+            ], 403);
+        }
+
+        try {
+            DB::transaction(function () use ($tx, $sender) {
+                // Refund sender
+                $sender->available_balance += $tx->amount;
+                $sender->save();
+
+                // Update transaction
+                $tx->status = 'canceled';
+                $tx->processed_at = now();
+                $tx->in_progress = false;
+                $tx->save();
+
+                // Log cancellation
+                TransactionLog::create([
+                    'transaction_id' => $tx->id,
+                    'action' => 'canceled',
+                    'note' => 'Sender canceled the transaction before release',
+                ]);
+
+                // Remove queued ReleaseFundsJob safely from MySQL queue
+                DB::table('jobs')
+                    ->where('queue', 'funds_releases')
+                    ->get()
+                    ->each(function ($job) use ($tx) {
+                        $payload = json_decode($job->payload, true);
+                        if (isset($payload['data']['transactionId']) && $payload['data']['transactionId'] == $tx->id) {
+                            DB::table('jobs')->where('id', $job->id)->delete();
+                        }
+                    });
+            });
+
+            return response()->json([
+                'message' => 'Transaction canceled successfully',
+                'transaction' => $tx,
+            ]);
+
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to cancel transaction',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
 
     public function requestMoney(Request $request)
     {
@@ -371,75 +457,79 @@ class TransactionController extends Controller
     }
 
 
-   public function history(Request $request)
-{
-    $user = auth()->user();
+    public function history(Request $request)
+    {
+        $user = auth()->user();
 
-    if ($user->user_status === 'banned') {
-        return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
-    }
+        if ($user->user_status === 'banned') {
+            return response()->json(['message' => 'Your account is restricted from sending money.'], 403);
+        }
 
-    $query = \App\Modules\Transaction\Models\Transaction::with(['sender:id,name', 'receiver:id,name'])
-        ->where(function ($q) use ($user) {
-            $q->where('sender_id', $user->id)
-              ->orWhere('receiver_id', $user->id);
-        })
-        ->latest();
+        $query = \App\Modules\Transaction\Models\Transaction::with(['sender:id,name', 'receiver:id,name'])
+            ->where(function ($q) use ($user) {
+                $q->where('sender_id', $user->id)
+                ->orWhere('receiver_id', $user->id);
+            })
+            ->latest();
 
-    if ($request->has('limit')) {
-        $transactions = $query->limit((int) $request->limit)->get();
-    } else {
-        $transactions = $query->paginate($request->get('per_page', 20));
-    }
+        if ($request->has('limit')) {
+            $transactions = $query->limit((int) $request->limit)->get();
+        } else {
+            $transactions = $query->paginate($request->get('per_page', 20));
+        }
 
-    $purposeLabels = [
-        'friends_family' => 'Family & Friends',
-        'goods_services' => 'Goods & Services',
-    ];
-
-    $currencySymbol = '₦';
-
-    $mapped = $transactions->map(function ($tx) use ($user, $purposeLabels, $currencySymbol) {
-        $isSender = $tx->sender_id === $user->id;
-        $amountSign = $isSender ? '-' : '+';
-        $title = $isSender ? 'Payment sent' : 'Payment received';
-
-        return [
-            // Raw DB fields for Dart model
-            'id' => $tx->id,
-            'sender_id' => $tx->sender_id,
-            'receiver_id' => $tx->receiver_id,
-            'amount' => $tx->amount,
-            'type' => $isSender ? 'send' : 'request', // or your real type column
-            'purpose' => $tx->purpose,
-            'reference' => $tx->reference,
-            'note' => $tx->note,
-            'status' => $tx->status,
-            'disputed' => (bool) $tx->disputed,
-            'processed_at' => $tx->processed_at,
-            'scheduled_release_at' => $tx->scheduled_release_at,
-            'created_at' => $tx->created_at,
-            'updated_at' => $tx->updated_at,
-
-            // UI helper fields for direct rendering
-            'title' => $title,
-            'subtitle' => $isSender ? ($tx->receiver->name ?? 'Unknown') : ($tx->sender->name ?? 'Unknown'),
-            'typeLabel' => $purposeLabels[$tx->purpose] ?? 'Other',
-            'amountFormatted' => $amountSign . $currencySymbol . number_format($tx->amount, 2),
-            'dateTime' => $tx->created_at->format('d/m/Y, H:i:s'),
-            'total' => $currencySymbol . number_format($user->balance ?? 0, 2),
+        $purposeLabels = [
+            'friends_family' => 'Family & Friends',
+            'goods_services' => 'Goods & Services',
         ];
-    });
 
-    return response()->json([
-        'data' => $mapped,
-        'meta' => [
-            'total' => $transactions instanceof \Illuminate\Pagination\AbstractPaginator
-                ? $transactions->total()
-                : $mapped->count(),
-        ],
-    ]);
-}
+        $currencySymbol = '₦';
+
+        $mapped = $transactions->map(function ($tx) use ($user, $purposeLabels, $currencySymbol) {
+            $isSender = $tx->sender_id === $user->id;
+            $amountSign = $isSender ? '-' : '+';
+            // If canceled, flip the signs: + for sender, - for receiver
+            if ($tx->status === 'canceled') {
+                $amountSign = $isSender ? '+' : '-';
+            }
+            $title = $isSender ? 'Payment sent' : 'Payment received';
+
+            return [
+                // Raw DB fields for Dart model
+                'id' => $tx->id,
+                'sender_id' => $tx->sender_id,
+                'receiver_id' => $tx->receiver_id,
+                'amount' => $tx->amount,
+                'type' => $isSender ? 'send' : 'request', // or your real type column
+                'purpose' => $tx->purpose,
+                'reference' => $tx->reference,
+                'note' => $tx->note,
+                'status' => $tx->status,
+                'disputed' => (bool) $tx->disputed,
+                'processed_at' => $tx->processed_at,
+                'scheduled_release_at' => $tx->scheduled_release_at,
+                'created_at' => $tx->created_at,
+                'updated_at' => $tx->updated_at,
+
+                // UI helper fields for direct rendering
+                'title' => $title,
+                'subtitle' => $isSender ? ($tx->receiver->name ?? 'Unknown') : ($tx->sender->name ?? 'Unknown'),
+                'typeLabel' => $purposeLabels[$tx->purpose] ?? 'Other',
+                'amountFormatted' => $amountSign . $currencySymbol . number_format($tx->amount, 2),
+                'dateTime' => $tx->created_at->format('d/m/Y, H:i:s'),
+                'total' => $currencySymbol . number_format($user->balance ?? 0, 2),
+            ];
+        });
+
+        return response()->json([
+            'data' => $mapped,
+            'meta' => [
+                'total' => $transactions instanceof \Illuminate\Pagination\AbstractPaginator
+                    ? $transactions->total()
+                    : $mapped->count(),
+            ],
+        ]);
+    }
 
 
 

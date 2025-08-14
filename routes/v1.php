@@ -30,5 +30,6 @@ Route::middleware('auth:api')->group(function () {
         Route::post('/respond/{id}', [TransactionController::class, 'respondToRequest']);
         Route::post('/dispute/{id}', [TransactionController::class, 'openDispute']);
         Route::get('/history', [TransactionController::class, 'history']);
+        Route::get('/cancel/{transactionId}', [TransactionController::class, 'cancelTransaction']);
     });
 });
