@@ -14,6 +14,9 @@ use Illuminate\Support\Str;
 use App\Models\RefreshToken;
 use Illuminate\Support\Facades\Log;
 use App\Modules\Auth\Rules\StrongPin;
+use App\Support\SessionRotation; // add this at the top
+use App\Services\Automation\FCMService;
+
 
 
 
@@ -126,7 +129,7 @@ class AuthController extends Controller
         ], 200);
     }
 
-    public function setPin(Request $request)
+    public function oldsetPin(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'email' => 'required|email|exists:users,email',
@@ -172,11 +175,70 @@ class AuthController extends Controller
         ], 200);
     }
 
+    public function setPin(Request $request, SessionRotation $sessionRotation)
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:users,email',
+            'pin'   => ['required', 'digits_between:4,6', new StrongPin()],
+            'device_id'   => 'required|string',
+            'device_name' => 'nullable|string',
+            'platform'    => 'nullable|string',
+            'fcm_token'   => 'nullable|string',
+        ]);
+
+        if ($validator->fails()) {
+            $errorMessages = $validator->errors()->all();
+
+            return response()->json([
+                'message' => $errorMessages[0] ?? 'Validation failed',
+            ], 422);
+        }
+
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user) {
+            return response()->json(['message' => 'User not found'], 404);
+        }
+
+        if ($user->pin) {
+            return response()->json(['message' => 'PIN already set'], 400);
+        }
+
+        $user->pin = bcrypt($request->pin);
+        $user->save();
+
+        return DB::transaction(function () use ($user, $request, $sessionRotation) {
+            // Generate access + refresh tokens
+            $accessToken  = JWTAuth::fromUser($user);
+            $refreshToken = Str::random(60);
+
+            $newToken = $user->refreshTokens()->create([
+                'token'       => hash('sha256', $refreshToken),
+                'expires_at'  => now()->addDays(30),
+                'device_id'   => $request->input('device_id'),
+                'device_name' => $request->input('device_name'),
+                'platform'    => $request->input('platform'),
+                'fcm_token'   => $request->input('fcm_token'),
+            ]);
+
+            // Revoke all other sessions except this one
+            $sessionRotation->pushAndRevokeOldSessions($user->id, $newToken->id);
+
+            return response()->json([
+                'message'       => 'PIN set successfully',
+                'user'          => $user,
+                'access_token'  => $accessToken,
+                'refresh_token' => $refreshToken,
+            ], 200);
+        });
+    }
 
 
 
 
-    public function verifyEmail(Request $request)
+
+
+    public function oldverifyEmail(Request $request)
     {
         $request->validate([
             'email' => 'required|email|exists:users,email',
@@ -213,10 +275,55 @@ class AuthController extends Controller
             'user' => $user,
         ]);
     }
+    public function verifyEmail(Request $request, SessionRotation $rotator)
+    {
+        $request->validate([
+            'email' => 'required|email|exists:users,email',
+            'otp_pin' => 'required|digits:6',
+            'device_id' => 'required|string',
+            'device_name' => 'required|string',
+            'platform' => 'required|string',
+            'fcm_token' => 'nullable|string',
+        ]);
+
+        $user = User::where('email', $request->email)
+            ->where('otp_pin', $request->otp_pin)
+            ->first();
+
+        if (!$user) {
+            return response()->json(['message' => 'Invalid verification code'], 400);
+        }
+
+        // ✅ mark verified
+        $user->is_verified = 1;
+        $user->otp_pin = null;
+        $user->save();
+
+        // 🔄 revoke old sessions + send push logout
+        $rotator->pushAndRevokeOldSessions($user->id);
+
+        // ✅ issue new tokens
+        $accessToken = JWTAuth::fromUser($user);
+        $plainRefresh = Str::random(60);
+
+        $user->refreshTokens()->create([
+            'token' => hash('sha256', $plainRefresh),
+            'expires_at' => now()->addDays(30),
+            'device_id' => $request->device_id,
+            'device_name' => $request->device_name,
+            'platform' => $request->platform,
+            'fcm_token' => $request->fcm_token,
+        ]);
+
+        return response()->json([
+            'access_token' => $accessToken,
+            'refresh_token' => $plainRefresh,
+            'user' => $user,
+        ]);
+    }
 
 
-
-    public function pinLogin(Request $request)
+    public function oldpinLogin(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'email' => 'required|email|exists:users,email',
@@ -258,7 +365,129 @@ class AuthController extends Controller
         ]);
     }
 
-    public function refreshWithToken(Request $request)
+
+    public function pinLogin(Request $request, SessionRotation $sessionRotation)
+    {
+        $validator = Validator::make($request->all(), [
+            'email'       => 'required|email|exists:users,email',
+            'pin'         => 'required|string|min:4|max:6',
+            'device_id'   => 'required|string',
+            'device_name' => 'nullable|string',
+            'platform'    => 'nullable|string',
+            'fcm_token'   => 'nullable|string',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Invalid login credentials',
+                'errors'  => $validator->errors(),
+            ], 422);
+        }
+
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user || !Hash::check($request->pin, $user->pin)) {
+            return response()->json(['message' => 'Invalid login credentials'], 401);
+        }
+
+        if ($user->otp_pin) {
+            return response()->json([
+                'message' => 'Email not verified. Please check your email for the code.',
+            ], 403);
+        }
+
+        return DB::transaction(function () use ($user, $request, $sessionRotation) {
+            $accessToken  = JWTAuth::fromUser($user);
+            $refreshToken = Str::random(60);
+
+            $existingSession = $user->refreshTokens()
+                ->active()
+                ->where('device_id', $request->device_id)
+                ->first();
+
+            if ($existingSession) {
+                $existingSession->update([
+                    'token'       => hash('sha256', $refreshToken),
+                    'expires_at'  => now()->addDays(30),
+                    'device_name' => $request->input('device_name'),
+                    'platform'    => $request->input('platform'),
+                    'fcm_token'   => $request->input('fcm_token'),
+                    'revoked_at'  => null,
+                ]);
+
+                $newToken = $existingSession;
+            } else {
+                $newToken = $user->refreshTokens()->create([
+                    'token'       => hash('sha256', $refreshToken),
+                    'expires_at'  => now()->addDays(30),
+                    'device_id'   => $request->input('device_id'),
+                    'device_name' => $request->input('device_name'),
+                    'platform'    => $request->input('platform'),
+                    'fcm_token'   => $request->input('fcm_token'),
+                ]);
+
+                // Revoke all other sessions for single-device enforcement
+                $sessionRotation->pushAndRevokeOldSessions($user->id, $newToken->id);
+            }
+
+            return response()->json([
+                'access_token'  => $accessToken,
+                'refresh_token' => $refreshToken,
+                'user'          => $user,
+            ]);
+        });
+    }
+
+    public function refreshWithToken(Request $request, SessionRotation $sessionRotation)
+    {
+        $refreshToken = $request->input('refresh_token');
+
+        if (!$refreshToken) {
+            return response()->json(['message' => 'Refresh token is required'], 422);
+        }
+
+        $hashed = hash('sha256', $refreshToken);
+
+        $storedToken = RefreshToken::with('user')
+            ->where('token', $hashed)
+            ->whereNull('revoked_at')
+            ->where('expires_at', '>', now())
+            ->first();
+
+        if (!$storedToken || !$storedToken->user) {
+            return response()->json(['message' => 'Invalid or expired refresh token'], 401);
+        }
+
+        $user = $storedToken->user;
+
+        return DB::transaction(function () use ($user, $storedToken, $request, $sessionRotation) {
+            $accessToken  = JWTAuth::fromUser($user);
+            $newRefreshToken = Str::random(60);
+
+            $newToken = $user->refreshTokens()->create([
+                'token'       => hash('sha256', $newRefreshToken),
+                'expires_at'  => now()->addDays(30),
+                'device_id'   => $storedToken->device_id,
+                'device_name' => $storedToken->device_name,
+                'platform'    => $storedToken->platform,
+                'fcm_token'   => $request->input('fcm_token', $storedToken->fcm_token),
+            ]);
+
+            // Revoke all other sessions except this one
+            $sessionRotation->pushAndRevokeOldSessions($user->id, $newToken->id);
+
+            // Revoke the old token
+            $storedToken->update(['revoked_at' => now()]);
+
+            return response()->json([
+                'access_token'  => $accessToken,
+                'refresh_token' => $newRefreshToken,
+            ]);
+        });
+    }
+
+
+    public function oldrefreshWithToken(Request $request)
     {
         $refreshToken = $request->input('refresh_token');
 
@@ -299,6 +528,10 @@ class AuthController extends Controller
             'refresh_token' => $newRefreshToken,
         ]);
     }
+
+
+
+
 
     public function logout()
     {
